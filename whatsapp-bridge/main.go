@@ -90,7 +90,50 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
-	return &MessageStore{db: db}, nil
+	store := &MessageStore{db: db}
+	if err := store.migrateAddQuotedColumns(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to migrate messages table: %v", err)
+	}
+
+	return store, nil
+}
+
+// migrateAddQuotedColumns adds the nullable quoted_id and quoted_sender
+// columns to messages if they are not already present. Additive-only: the
+// table is never dropped or recreated, so existing rows and the other
+// consumers of messages.db (whatsapp-mcp-server, _CERES) are unaffected.
+// Idempotent — safe to call on every startup.
+func (store *MessageStore) migrateAddQuotedColumns() error {
+	rows, err := store.db.Query(`PRAGMA table_info(messages)`)
+	if err != nil {
+		return fmt.Errorf("failed to inspect messages table: %v", err)
+	}
+
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("failed to scan table_info row: %v", err)
+		}
+		existing[name] = true
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+
+	for _, col := range []string{"quoted_id", "quoted_sender"} {
+		if existing[col] {
+			continue
+		}
+		if _, err := store.db.Exec(fmt.Sprintf("ALTER TABLE messages ADD COLUMN %s TEXT", col)); err != nil {
+			return fmt.Errorf("failed to add column %s: %v", col, err)
+		}
+	}
+	return nil
 }
 
 // Close the database connection
@@ -109,19 +152,31 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	quotedID, quotedSender string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
 	}
 
 	_, err := store.db.Exec(
-		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT OR REPLACE INTO messages
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_id, quoted_sender)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		nullIfEmpty(quotedID), nullIfEmpty(quotedSender),
 	)
 	return err
+}
+
+// nullIfEmpty converts an empty string to a real SQL NULL instead of
+// persisting "" — keeps quoted_id/quoted_sender NULL for context-free
+// messages rather than empty strings.
+func nullIfEmpty(s string) interface{} {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // Get messages from a chat
@@ -189,10 +244,27 @@ func extractTextContent(msg *waProto.Message) string {
 	return ""
 }
 
+// Extract quoted-message metadata (stanza id + participant) from a message's
+// ContextInfo, if present. Nil-safe end to end: messages without a quoted
+// reply (or without an ExtendedTextMessage at all) return two empty
+// strings, which StoreMessage persists as NULL — identical behavior to
+// before this column existed.
+func extractQuotedInfo(msg *waProto.Message) (quotedID, quotedSender string) {
+	ctx := msg.GetExtendedTextMessage().GetContextInfo()
+	return ctx.GetStanzaID(), ctx.GetParticipant()
+}
+
 // SendMessageResponse represents the response for the send message API
 type SendMessageResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
+	// MessageID is whatsmeow's SendResponse.ID for the sent message — empty
+	// string when unavailable (send failed, or no ID was returned). Additive
+	// field: existing consumers read success/message via dict .get() with no
+	// strict schema validation (verified against _CERES/messaging.py and
+	// whatsapp-mcp-server/whatsapp.py), so an unknown extra key is a no-op
+	// for them. Needed to resolve quoted-reply HITL matching.
+	MessageID string `json:"message_id"`
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -202,10 +274,12 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
-// Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+// Function to send a WhatsApp message. Third return value is the sent
+// message's ID (whatsmeow SendResponse.ID) — empty string on any failure
+// path or if unavailable.
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string, string) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "Not connected to WhatsApp", ""
 	}
 
 	// Create JID for recipient
@@ -219,7 +293,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, fmt.Sprintf("Error parsing JID: %v", err), ""
 		}
 	} else {
 		// Create JID from phone number
@@ -236,7 +310,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, fmt.Sprintf("Error reading media file: %v", err), ""
 		}
 
 		// Determine media type and mime type based on file extension
@@ -285,7 +359,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return false, fmt.Sprintf("Error uploading media: %v", err), ""
 		}
 
 		fmt.Println("Media uploaded", resp)
@@ -315,7 +389,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), ""
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -362,13 +436,13 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	sendResp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return false, fmt.Sprintf("Error sending message: %v", err), ""
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	return true, fmt.Sprintf("Message sent to %s", recipient), sendResp.ID
 }
 
 // Extract media info from a message
@@ -434,6 +508,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		return
 	}
 
+	// Extract quoted-message metadata (nil-safe; empty strings if no quote)
+	quotedID, quotedSender := extractQuotedInfo(msg.Message)
+
 	// Store message in database
 	err = messageStore.StoreMessage(
 		msg.Info.ID,
@@ -449,6 +526,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		quotedID,
+		quotedSender,
 	)
 
 	if err != nil {
@@ -641,7 +720,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -706,8 +785,8 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
+		success, message, messageID := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		fmt.Println("Message sent", success, message, messageID)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
@@ -718,8 +797,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		// Send response
 		json.NewEncoder(w).Encode(SendMessageResponse{
-			Success: success,
-			Message: message,
+			Success:   success,
+			Message:   message,
+			MessageID: messageID,
 		})
 	})
 
@@ -800,14 +880,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -973,7 +1053,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1068,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
@@ -1112,6 +1192,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
+				// Extract quoted-message metadata (nil-safe; empty strings if no quote)
+				quotedID, quotedSender := extractQuotedInfo(msg.Message.Message)
+
 				err = messageStore.StoreMessage(
 					msgID,
 					chatJID,
@@ -1126,6 +1209,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					quotedID,
+					quotedSender,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
